@@ -2,6 +2,8 @@
 新規参加者へDMを送るDiscordボット
 設定はすべてスラッシュコマンドから行う（サーバーごとに保存）
 コマンドは「サーバー管理」権限または許可ロールのみ実行可能
+
+必須: Developer Portal の Bot タブで SERVER MEMBERS INTENT を ON にすること
 """
 import os
 import json
@@ -9,13 +11,17 @@ import asyncio
 import logging
 from pathlib import Path
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = os.getenv("GUILD_ID")          # 任意: 入れるとコマンド反映が即時になる
-DATA_FILE = Path(os.getenv("DATA_FILE", "data/guilds.json"))
+GUILD_ID = os.getenv("GUILD_ID")  # 任意: 入れるとコマンド反映が即時になる
+
+_BASE_DIR = Path(__file__).resolve().parent
+_data_env = os.getenv("DATA_FILE")
+DATA_FILE = Path(_data_env).expanduser().resolve() if _data_env else _BASE_DIR / "data" / "guilds.json"
 
 DEFAULT_MESSAGE = "**{server}** に参加してくれてありがとう、{user}！\nまずは下のリンクを読んでね。"
 DEFAULT_LINK_LABEL = "リンクを開く"
@@ -25,8 +31,22 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger("joindm")
 
 intents = discord.Intents.default()
-intents.members = True          # ← これが無いと on_member_join が動かない
+intents.members = True   # ← これが無いと on_member_join が動かない（Portal側のONも必須）
 intents.guilds = True
+
+DM_SEND_INTERVAL = 1.0    # レート制限対策の送信間隔
+QUEUE_WAIT_TIMEOUT = 60.0 # アイドル時にループを回して生存確認
+
+
+def default_cfg() -> dict:
+    return {
+        "enabled": True,
+        "message": DEFAULT_MESSAGE,
+        "link": "",
+        "link_label": DEFAULT_LINK_LABEL,
+        "log_channel": None,
+        "admin_roles": [],
+    }
 
 
 # ---------- ユーティリティ ----------
@@ -44,11 +64,13 @@ def render(template: str, member: discord.Member) -> str:
     return out
 
 
-class LinkView(discord.ui.View):
-    def __init__(self, url: str, label: str):
-        super().__init__(timeout=None)
-        self.add_item(discord.ui.Button(label=label[:80], url=url,
-                                        style=discord.ButtonStyle.link))
+def build_view(url: str, label: str) -> discord.ui.View | None:
+    if not url or not url.startswith(("http://", "https://")):
+        return None
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(label=(label or DEFAULT_LINK_LABEL)[:80],
+                                    url=url, style=discord.ButtonStyle.link))
+    return view
 
 
 # ---------- Bot ----------
@@ -58,25 +80,34 @@ class JoinDM(commands.Bot):
         self.data: dict = {}
         self._save_lock = asyncio.Lock()
         self._queue: asyncio.Queue = asyncio.Queue()
+        self._worker_task: asyncio.Task | None = None
 
     # --- 永続化 ---
     def load_data(self):
         if DATA_FILE.exists():
             try:
                 self.data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
+                log.info("設定を読み込みました: %s (%d件)", DATA_FILE, len(self.data))
+            except (json.JSONDecodeError, OSError):
                 log.warning("データファイル破損。空で開始します")
                 self.data = {}
+        else:
+            log.info("データファイル未作成: %s（新規作成します）", DATA_FILE)
 
     def cfg(self, guild_id: int) -> dict:
+        """書き込み用。辞書が無ければ既定値で作る"""
         c = self.data.setdefault(str(guild_id), {})
-        c.setdefault("enabled", True)
-        c.setdefault("message", DEFAULT_MESSAGE)
-        c.setdefault("link", "")
-        c.setdefault("link_label", DEFAULT_LINK_LABEL)
-        c.setdefault("log_channel", None)
-        c.setdefault("admin_roles", [])
+        for k, v in default_cfg().items():
+            c.setdefault(k, v)
         return c
+
+    def get_cfg(self, guild_id: int) -> dict:
+        """読み取り専用。データを汚さない"""
+        merged = default_cfg()
+        merged.update(self.data.get(str(guild_id)) or {})
+        if not isinstance(merged.get("admin_roles"), list):
+            merged["admin_roles"] = []
+        return merged
 
     async def save(self):
         async with self._save_lock:
@@ -89,29 +120,51 @@ class JoinDM(commands.Bot):
     # --- 起動 ---
     async def setup_hook(self):
         self.load_data()
-        asyncio.create_task(self._dm_worker())
+        if not self.intents.members:
+            raise SystemExit("intents.members が False です。SERVER MEMBERS INTENT を ON にしてください")
+        log.info("SERVER MEMBERS INTENT: %s", "ON" if self.intents.members else "OFF")
+        log.info("データ保存先: %s", DATA_FILE)
+
+        # 参照を保持しないとGCでタスクが消える
+        self._worker_task = asyncio.create_task(self._dm_worker())
+
         if GUILD_ID:
             g = discord.Object(id=int(GUILD_ID))
             self.tree.copy_global_to(guild=g)
             await self.tree.sync(guild=g)
+            log.info("ギルド %s にコマンドを同期しました", GUILD_ID)
         else:
             await self.tree.sync()
+            log.info("グローバルコマンドを同期しました（反映に最大1時間）")
 
-    # --- DM送信キュー（レート制限対策で1秒間隔） ---
+    async def close(self):
+        if self._worker_task and not self._worker_task.done():
+            self._worker_task.cancel()
+        await super().close()
+
+    # --- DM送信キュー ---
     async def _dm_worker(self):
         while True:
-            member, cfg = await self._queue.get()
+            try:
+                member, cfg = await asyncio.wait_for(self._queue.get(),
+                                                     timeout=QUEUE_WAIT_TIMEOUT)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                raise
             try:
                 await self._send_dm(member, cfg)
             except Exception:
                 log.exception("DM処理中に例外")
             finally:
                 self._queue.task_done()
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(DM_SEND_INTERVAL)
 
     async def _send_dm(self, member: discord.Member, cfg: dict):
         if member.guild.get_member(member.id) is None:
-            return  # 送信前に退出した
+            log.warning("スキップ: %s がキャッシュに無い（Members Intent / キャッシュの問題）", member.id)
+            return
+
         text = render(cfg["message"], member)[:2000]
         embed = discord.Embed(description=text, color=0x5865F2)
         if member.guild.icon:
@@ -119,31 +172,49 @@ class JoinDM(commands.Bot):
             embed.set_thumbnail(url=member.guild.icon.url)
         else:
             embed.set_author(name=member.guild.name)
-        view = LinkView(cfg["link"], cfg["link_label"]) if cfg["link"] else None
 
-        try:
-            await member.send(embed=embed, view=view)
-        except discord.Forbidden:
-            await self._log_result(member, "DMが拒否されました（DM許可設定の可能性）")
-        except discord.HTTPException as e:
-            await self._log_result(member, f"送信失敗: {e}")
-        else:
-            await self._log_result(member, None)
+        view = build_view(cfg.get("link", ""), cfg.get("link_label", DEFAULT_LINK_LABEL))
+        if cfg.get("link") and view is None:
+            log.warning("リンクURLが不正なのでボタン無しで送信: %r", cfg.get("link"))
+
+        last_err: Exception | None = None
+        for attempt in (1, 2):
+            try:
+                await member.send(embed=embed, view=view)
+            except discord.Forbidden:
+                log.warning("DM拒否: %s (%s) — 相手のDM許可設定を確認", member, member.id)
+                await self._log_result(member, "DMが拒否されました（DM許可設定の可能性）")
+                return
+            except discord.HTTPException as e:
+                last_err = e
+                log.warning("DM送信失敗(%d回目): %s -> %s", attempt, member, e)
+                if attempt == 1 and (e.status == 429 or (e.status and e.status >= 500)):
+                    await asyncio.sleep(2)
+                    continue
+                await self._log_result(member, f"送信失敗: {e}")
+                return
+            else:
+                log.info("DM送信OK: %s (%s)", member, member.id)
+                await self._log_result(member, None)
+                return
+        if last_err:
+            await self._log_result(member, f"送信失敗: {last_err}")
 
     async def _log_result(self, member: discord.Member, error: str | None):
-        ch_id = self.cfg(member.guild.id).get("log_channel")
+        ch_id = self.get_cfg(member.guild.id).get("log_channel")
         if not ch_id:
             return
         ch = member.guild.get_channel(ch_id)
         if not isinstance(ch, discord.TextChannel):
+            log.warning("ログ先チャンネルが見つかりません: %s", ch_id)
             return
         try:
             if error:
                 await ch.send(f"⚠️ {member.mention} へのDM失敗: {error}")
             else:
                 await ch.send(f"✅ {member.mention} へDMを送信しました")
-        except discord.HTTPException:
-            pass
+        except discord.HTTPException as e:
+            log.warning("ログ送信失敗: %s", e)
 
 
 bot = JoinDM()
@@ -152,16 +223,22 @@ bot = JoinDM()
 @bot.event
 async def on_ready():
     log.info("ログイン: %s (id=%s)", bot.user, bot.user.id)
+    log.info("参加サーバー数: %d", len(bot.guilds))
 
 
 @bot.event
 async def on_member_join(member: discord.Member):
+    log.info("join event: %s (id=%s) guild=%s", member, member.id, member.guild.id)
     if member.bot:
         return
-    cfg = bot.cfg(member.guild.id)
-    if not cfg["enabled"] or not cfg["message"].strip():
+    cfg = bot.get_cfg(member.guild.id)
+    if not cfg["enabled"]:
+        log.info("DM無効のためスキップ: guild=%s", member.guild.id)
         return
-    await bot._queue.put((member, dict(cfg)))
+    if not cfg["message"].strip():
+        log.info("本文が空のためスキップ: guild=%s", member.guild.id)
+        return
+    await bot._queue.put((member, cfg))
 
 
 # ---------- 権限チェック ----------
@@ -170,7 +247,7 @@ def is_operator(itx: discord.Interaction) -> bool:
     perms = itx.user.guild_permissions
     if perms.administrator or perms.manage_guild:
         return True
-    allowed = set(bot.cfg(itx.guild_id).get("admin_roles", []))
+    allowed = set(bot.get_cfg(itx.guild_id).get("admin_roles") or [])
     if allowed and any(r.id in allowed for r in getattr(itx.user, "roles", [])):
         return True
     return False
@@ -245,7 +322,7 @@ class Config(commands.GroupCog, name="config", description="DM設定（管理者
     @app_commands.guild_only()
     async def allow_role(self, itx: discord.Interaction, role: discord.Role):
         cfg = bot.cfg(itx.guild_id)
-        roles = set(cfg.get("admin_roles", []))
+        roles = set(cfg.get("admin_roles") or [])
         roles.add(role.id)
         cfg["admin_roles"] = list(roles)
         await bot.save()
@@ -256,7 +333,7 @@ class Config(commands.GroupCog, name="config", description="DM設定（管理者
     @app_commands.guild_only()
     async def disallow_role(self, itx: discord.Interaction, role: discord.Role):
         cfg = bot.cfg(itx.guild_id)
-        roles = set(cfg.get("admin_roles", []))
+        roles = set(cfg.get("admin_roles") or [])
         roles.discard(role.id)
         cfg["admin_roles"] = list(roles)
         await bot.save()
@@ -265,7 +342,7 @@ class Config(commands.GroupCog, name="config", description="DM設定（管理者
     @app_commands.command(name="show", description="現在の設定を表示")
     @app_commands.guild_only()
     async def show(self, itx: discord.Interaction):
-        cfg = bot.cfg(itx.guild_id)
+        cfg = bot.get_cfg(itx.guild_id)
         e = discord.Embed(title="現在の設定", color=0x5865F2)
         e.add_field(name="状態", value="🟢 有効" if cfg["enabled"] else "🔴 無効", inline=True)
         e.add_field(name="リンク", value=cfg["link"] or "未設定", inline=True)
@@ -280,8 +357,30 @@ class Config(commands.GroupCog, name="config", description="DM設定（管理者
     @app_commands.guild_only()
     async def test(self, itx: discord.Interaction):
         await itx.response.defer(ephemeral=True)
-        await bot._send_dm(itx.user, dict(bot.cfg(itx.guild_id)))
+        try:
+            await bot._send_dm(itx.user, bot.get_cfg(itx.guild_id))
+        except Exception as e:
+            log.exception("テスト送信で例外")
+            return await itx.followup.send(f"テスト送信で例外: {e}", ephemeral=True)
         await itx.followup.send("テストDMを送りました（届かない場合はDM設定を確認）", ephemeral=True)
+
+    @app_commands.command(name="diagnose", description="DMが飛ばない原因を切り分け")
+    @app_commands.guild_only()
+    async def diagnose(self, itx: discord.Interaction):
+        await itx.response.defer(ephemeral=True)
+        me = itx.guild.me
+        cfg = bot.get_cfg(itx.guild_id)
+        lines = [
+            f"members intent: {'ON' if bot.intents.members else 'OFF'}",
+            f"gateway 接続: {'OK' if bot.is_ws_ratelimited() is False else '要確認'} / latency={bot.latency:.3f}s",
+            f"bot ロール位置: {me.top_role.position}",
+            f"自分のキャッシュ: {'あり' if itx.guild.get_member(itx.user.id) else 'なし'}",
+            f"サーバーのキャッシュ人数: {itx.guild.member_count}",
+            f"設定 enabled: {cfg['enabled']} / 本文長: {len(cfg['message'])} / リンク: {cfg['link'] or 'なし'}",
+            f"キュー残り: {bot._queue.qsize()}",
+            f"ワーカー稼働: {'はい' if bot._worker_task and not bot._worker_task.done() else 'いいえ'}",
+        ]
+        await itx.followup.send("```\n" + "\n".join(lines) + "\n```", ephemeral=True)
 
     @app_commands.command(name="reset", description="設定を初期値に戻す")
     @app_commands.guild_only()
@@ -322,9 +421,20 @@ async def on_app_command_error(itx: discord.Interaction, error: app_commands.App
 async def main():
     if not TOKEN:
         raise SystemExit("DISCORD_TOKEN が未設定です")
+
     async with bot:
         await bot.add_cog(Config())
-        await bot.start(TOKEN)
+        await bot.login(TOKEN)  # ログインは1回だけ
+        delay = 5
+        while True:
+            try:
+                await bot.connect()  # 初回ハンドシェイク失敗(503等)をここで受ける
+                break
+            except (aiohttp.ClientError, asyncio.TimeoutError,
+                    discord.GatewayNotFound, OSError) as e:
+                log.warning("Gateway接続失敗: %s → %d秒後に再試行", e, delay)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60)
 
 
 if __name__ == "__main__":
